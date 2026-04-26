@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(du -h F:DW-NB/results/figures/*)",
+      "Bash(ls:*)",
+      "Bash(find F:DW-NB -not -path */.git/* -type f -printf '%h %f\\\\n')",
+      "Bash(conda run:*)",
+      "Bash(git remote:*)",
+      "Bash(git push:*)",
+      "Bash(rm -rf .git)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
