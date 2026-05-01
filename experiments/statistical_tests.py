@@ -175,7 +175,11 @@ def _write_report(results_dir: Path, raw_df: pd.DataFrame) -> None:
         return out
 
     dataset_summary = _sanitize(_read(summary_dir / "dataset_summary.csv"))
-    acc_table = _sanitize(_read(summary_dir / "accuracy_table.csv"))
+    # Support both old name ("accuracy_table.csv") and new name ("accuracy_table_mean.csv").
+    _acc_path = summary_dir / "accuracy_table_mean.csv"
+    if not _acc_path.exists():
+        _acc_path = summary_dir / "accuracy_table.csv"
+    acc_table = _sanitize(_read(_acc_path))
     cv_lambda = _sanitize(_read(stats_dir / "cv_lambda_distribution.csv"))
     agreement = _sanitize(_read(stats_dir / "agreement_vs_gain.csv"))
     weight_ablation = _sanitize(_read(stats_dir / "weight_ablation.csv"))
@@ -230,17 +234,23 @@ def _write_report(results_dir: Path, raw_df: pd.DataFrame) -> None:
 
     runtime_note = "Runtime statistics unavailable."
     try:
-        acc_long = raw_df[raw_df["metric"] == "accuracy"]
-        t_fix = (
-            acc_long[acc_long["classifier"] == DW_FIXED][["fit_time", "predict_time"]]
-            .sum(axis=1)
-            .mean()
-        )
-        t_cv = (
-            acc_long[acc_long["classifier"] == DW_CV][["fit_time", "predict_time"]]
-            .sum(axis=1)
-            .mean()
-        )
+        # New format: fit_time stored as metric rows.
+        # Old format: fit_time stored as a column alongside metric/value.
+        ft_fix_rows = raw_df[
+            (raw_df["classifier"] == DW_FIXED) & (raw_df["metric"] == "fit_time")
+        ]["value"]
+        ft_cv_rows = raw_df[
+            (raw_df["classifier"] == DW_CV) & (raw_df["metric"] == "fit_time")
+        ]["value"]
+        if not ft_fix_rows.empty and not ft_cv_rows.empty:
+            t_fix = float(ft_fix_rows.mean())
+            t_cv  = float(ft_cv_rows.mean())
+        elif "fit_time" in raw_df.columns:
+            acc_long = raw_df[raw_df["metric"] == "accuracy"]
+            t_fix = float(acc_long[acc_long["classifier"] == DW_FIXED]["fit_time"].mean())
+            t_cv  = float(acc_long[acc_long["classifier"] == DW_CV]["fit_time"].mean())
+        else:
+            t_fix, t_cv = float("nan"), float("nan")
         if np.isfinite(t_fix) and np.isfinite(t_cv) and t_fix > 0:
             runtime_note = (
                 f"DW-NB(CV-{LAMBDA_CHAR}) mean fold runtime is {t_cv / t_fix:.2f}x of fixed "
@@ -385,7 +395,7 @@ def main() -> None:
             .pivot(index="dataset", columns="classifier", values="value")
             .dropna()
         )
-        if pivot.shape[1] < 3 or pivot.shape[0] < 2:
+        if pivot.shape[0] < 3 or pivot.shape[1] < 3:
             continue
         arrays = [pivot[col].to_numpy() for col in pivot.columns]
         stat, p = friedmanchisquare(*arrays)
