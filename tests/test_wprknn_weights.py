@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.wprknn_weights import _compute_w3_neighbor_weights, compute_wprknn_weights
+from src.wprknn_weights import compute_wprknn_weights
 
 
 def test_w2_is_probability_vector_per_test_point() -> None:
@@ -56,13 +56,26 @@ def test_w3_all_distances_equal_matches_counts_and_w2() -> None:
 
 
 def test_w3_extremes_for_distances_1_2_3() -> None:
-    distances = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-    w3 = _compute_w3_neighbor_weights(distances)
+    """Verify w3 per-neighbor formula via one-class-per-neighbor setup.
 
+    Each of 3 train points is a distinct class, so w3_raw[class_c] equals
+    the per-neighbor w3 weight for the neighbor in that class.
+    """
+    X_test = np.array([[0.0]])
+    X_train = np.array([[1.0], [2.0], [3.0]])
+    y_train = np.array([0, 1, 2])
+    classes = np.array([0, 1, 2])
+
+    W, _ = compute_wprknn_weights(
+        X_test, X_train, y_train, classes, k=3, weight_components=["w3"]
+    )
+    # Raw per-neighbor w3: nearest=1.0, middle=5/8, farthest=0.0
+    # After normalization (sum = 1.0 + 0.625 = 1.625):
     expected_mid = ((3.0 - 2.0) / (3.0 - 1.0)) * ((3.0 + 2.0) / (3.0 + 1.0))
-    assert np.isclose(w3[0], 1.0, atol=1e-12)
-    assert np.isclose(w3[2], 0.0, atol=1e-12)
-    assert np.isclose(w3[1], expected_mid, atol=1e-12)
+    raw_sum = 1.0 + expected_mid + 0.0
+    assert np.isclose(W[0, 0], 1.0 / raw_sum, atol=1e-12)
+    assert np.isclose(W[0, 2], 0.0, atol=1e-12)
+    assert np.isclose(W[0, 1], expected_mid / raw_sum, atol=1e-12)
 
 
 def test_ablation_w1_only_sums_to_one() -> None:

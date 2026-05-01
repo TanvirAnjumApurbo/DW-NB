@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import numpy as np
@@ -69,22 +68,24 @@ def macro_geometric_mean(
     y_pred: NDArray[np.generic],
     classes: NDArray[np.generic],
 ) -> float:
-    """Compute macro-averaged geometric mean of sensitivity and specificity."""
+    """Geometric mean of per-class recall: (∏_c recall_c)^(1/n_classes).
+
+    Returns 0.0 if any class recall is zero.
+    """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     classes = np.asarray(classes)
-    g_scores: list[float] = []
-    for cls in classes:
-        y_true_pos = y_true == cls
-        y_pred_pos = y_pred == cls
-        tp = float(np.sum(y_true_pos & y_pred_pos))
-        fn = float(np.sum(y_true_pos & ~y_pred_pos))
-        fp = float(np.sum(~y_true_pos & y_pred_pos))
-        tn = float(np.sum(~y_true_pos & ~y_pred_pos))
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-        g_scores.append(math.sqrt(sensitivity * specificity))
-    return float(np.mean(g_scores))
+    recalls = []
+    for c in classes:
+        mask = y_true == c
+        if mask.sum() == 0:
+            recalls.append(0.0)
+        else:
+            recalls.append(float((y_pred[mask] == c).mean()))
+    recalls_arr = np.array(recalls)
+    if np.any(recalls_arr == 0):
+        return 0.0
+    return float(np.prod(recalls_arr) ** (1.0 / len(recalls_arr)))
 
 
 def _safe_auc_roc(

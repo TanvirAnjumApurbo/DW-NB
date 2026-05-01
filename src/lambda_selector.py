@@ -84,6 +84,10 @@ def cv_lambda_selector(
 ) -> Callable[[NDArray[np.float64], NDArray[np.generic]], float]:
     """Return a selector using inner CV over lambda candidates.
 
+    The fold loop is outermost: GaussianNB training, kNN queries, and
+    WPRkNN weight computation happen once per fold and are reused across
+    all lambda candidates, avoiding redundant work.
+
     Parameters
     ----------
     lambda_grid : Sequence[float], default=(0.0, ..., 1.0)
@@ -139,39 +143,47 @@ def cv_lambda_selector(
         n_splits = min(n_inner_folds, max_folds)
 
         cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-        mean_scores: list[float] = []
+        n_lambdas = len(grid)
 
-        for lam in grid:
-            fold_scores: list[float] = []
-            for train_idx, val_idx in cv.split(X_arr, y_arr):
-                X_tr = X_arr[train_idx]
-                y_tr = y_arr[train_idx]
-                X_val = X_arr[val_idx]
-                y_val = y_arr[val_idx]
+        # Accumulate scores: rows = lambdas, cols = folds
+        fold_scores = np.zeros((n_lambdas, n_splits), dtype=np.float64)
 
-                model = GaussianNB(var_smoothing=var_smoothing)
-                model.fit(X_tr, y_tr)
-                classes = model.classes_
-                log_p_nb = model.predict_log_proba(X_val)
+        for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X_arr, y_arr)):
+            X_tr = X_arr[train_idx]
+            y_tr = y_arr[train_idx]
+            X_val = X_arr[val_idx]
+            y_val = y_arr[val_idx]
 
-                W, _ = compute_wprknn_weights(
-                    X_test=X_val,
-                    X_train=X_tr,
-                    y_train=y_tr,
-                    classes=classes,
-                    k=k,
-                    weight_components=list(weight_components),
-                    eps=eps,
-                    metric=metric,
-                    nn_index=None,
-                )
-                log_fused = (1.0 - lam) * log_p_nb + lam * np.log(W + eps)
+            # ── Expensive work: done once per fold ──
+            model = GaussianNB(var_smoothing=var_smoothing)
+            model.fit(X_tr, y_tr)
+            classes = model.classes_
+            log_p_nb = model.predict_log_proba(X_val)
+
+            W, _ = compute_wprknn_weights(
+                X_test=X_val,
+                X_train=X_tr,
+                y_train=y_tr,
+                classes=classes,
+                k=k,
+                weight_components=list(weight_components),
+                eps=eps,
+                metric=metric,
+                nn_index=None,
+            )
+            log_W = np.log(W + eps)
+
+            # ── Cheap work: sweep lambdas using precomputed arrays ──
+            for lam_idx, lam in enumerate(grid):
+                log_fused = (1.0 - lam) * log_p_nb + lam * log_W
                 log_norm = logsumexp(log_fused, axis=1, keepdims=True)
                 y_pred = classes[np.argmax(log_fused - log_norm, axis=1)]
-                fold_scores.append(_score_predictions(y_val, y_pred, scoring=scoring))
-            mean_scores.append(float(np.mean(fold_scores)))
+                fold_scores[lam_idx, fold_idx] = _score_predictions(
+                    y_val, y_pred, scoring=scoring
+                )
 
-        best_idx = int(np.argmax(np.asarray(mean_scores)))
+        mean_scores = fold_scores.mean(axis=1)
+        best_idx = int(np.argmax(mean_scores))
         return float(grid[best_idx])
 
     return selector

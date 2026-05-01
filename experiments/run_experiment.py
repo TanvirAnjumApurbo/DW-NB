@@ -6,7 +6,7 @@ import argparse
 import logging
 import sys
 import time
-from dataclasses import dataclass
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 from sklearn.model_selection import StratifiedKFold
-from tabulate import tabulate
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,10 +21,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.baselines import get_baselines  # noqa: E402
-from src.datasets import DATASET_ORDER, load_all_datasets, load_dataset  # noqa: E402
+from src.datasets import DATASET_ORDER, get_dataset_names, load_dataset  # noqa: E402
 from src.metrics import compute_all_metrics  # noqa: E402
 from src.utils import (  # noqa: E402
-    atomic_write_csv,
     configure_logging,
     ensure_dir,
     seed_everything,
@@ -33,11 +31,18 @@ from src.utils import (  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True)
-class Task:
-    dataset_name: str
-    classifier_name: str
+METRICS = [
+    "accuracy",
+    "macro_f1",
+    "auc_roc",
+    "log_loss",
+    "brier_score",
+    "ece",
+    "balanced_accuracy",
+    "geometric_mean",
+    "mcc",
+    "weighted_f1",
+]
 
 
 def _parse_csv_arg(value: str) -> list[str]:
@@ -56,10 +61,8 @@ def _parse_classifier_arg(value: str, available: list[str]) -> list[str]:
     tokens = _parse_csv_arg(value)
     if tokens and all(tok in available for tok in tokens):
         return tokens
-    # Fallback for names containing commas, e.g. "DW-NB(k=15,λ=0.5),GaussianNB"
     matched = [name for name in available if name in value]
     if matched:
-        # Preserve registry order.
         return [name for name in available if name in matched]
     return tokens
 
@@ -82,110 +85,116 @@ def _build_baselines(
     return baselines
 
 
-def _run_single_task(
-    task: Task,
+def _run_single_fold(
+    clf_factory: Any,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    classes: np.ndarray,
+) -> dict[str, float]:
+    clf = clf_factory()
+
+    t0 = time.perf_counter()
+    clf.fit(X_train, y_train)
+    fit_time = time.perf_counter() - t0
+
+    t1 = time.perf_counter()
+    y_proba = clf.predict_proba(X_test)
+    predict_time = time.perf_counter() - t1
+
+    # Ensure y_proba covers all classes (handles folds where a class is absent from train).
+    if y_proba.shape[1] < len(classes):
+        full_proba = np.zeros((len(X_test), len(classes)))
+        fitted_classes = np.asarray(clf.classes_) if hasattr(clf, "classes_") else np.unique(y_train)
+        for i, c in enumerate(fitted_classes):
+            idx = np.where(classes == c)[0]
+            if len(idx) > 0:
+                full_proba[:, idx[0]] = y_proba[:, i]
+        y_proba = full_proba
+
+    y_pred = classes[np.argmax(y_proba, axis=1)]
+
+    fold_metrics = compute_all_metrics(
+        y_true=y_test,
+        y_pred=y_pred,
+        y_proba=y_proba,
+        classes=classes,
+        classifier=clf,
+        X_test=X_test,
+        predict_time=predict_time,
+    )
+    fold_metrics["fit_time"] = fit_time
+    fold_metrics["predict_time"] = predict_time
+    return fold_metrics
+
+
+def _run_classifier_on_dataset(
+    ds_name: str,
+    clf_name: str,
+    clf_factory: Any,
     X: np.ndarray,
     y: np.ndarray,
-    clf_factory: Any,
     n_folds: int,
     random_state: int,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Run one classifier across all folds of one dataset."""
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
 
-    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X, y), start=1):
+    classes = np.unique(y)
+    min_class_count = int(np.min(np.bincount(y.astype(int))))
+    actual_folds = min(n_folds, min_class_count)
+    if actual_folds < n_folds:
+        LOGGER.warning(
+            "%s / %s: reducing folds %d → %d (min class size=%d)",
+            ds_name, clf_name, n_folds, actual_folds, min_class_count,
+        )
+
+    skf = StratifiedKFold(n_splits=actual_folds, shuffle=True, random_state=random_state)
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X, y)):
         try:
-            X_train = X[train_idx]
-            y_train = y[train_idx]
-            X_test = X[test_idx]
-            y_test = y[test_idx]
-
-            clf = clf_factory()
-            if hasattr(clf, "dataset_name_"):
-                setattr(clf, "dataset_name_", task.dataset_name)
-            else:
-                try:
-                    setattr(clf, "dataset_name_", task.dataset_name)
-                except Exception:
-                    pass
-
-            t0 = time.perf_counter()
-            clf.fit(X_train, y_train)
-            fit_time = time.perf_counter() - t0
-
-            t1 = time.perf_counter()
-            y_proba = clf.predict_proba(X_test)
-            predict_time = time.perf_counter() - t1
-            classes = np.asarray(clf.classes_)
-            y_pred = classes[np.argmax(y_proba, axis=1)]
-
-            fold_metrics = compute_all_metrics(
-                y_true=y_test,
-                y_pred=y_pred,
-                y_proba=y_proba,
+            fold_metrics = _run_single_fold(
+                clf_factory=clf_factory,
+                X_train=X[train_idx],
+                y_train=y[train_idx],
+                X_test=X[test_idx],
+                y_test=y[test_idx],
                 classes=classes,
-                classifier=clf,
-                X_test=X_test,
-                predict_time=predict_time,
             )
-            for metric_name, metric_value in fold_metrics.items():
+            for metric_name, value in fold_metrics.items():
                 rows.append(
                     {
-                        "dataset": task.dataset_name,
-                        "classifier": task.classifier_name,
+                        "dataset": ds_name,
+                        "classifier": clf_name,
                         "fold": fold_idx,
                         "metric": metric_name,
-                        "value": float(metric_value),
-                        "fit_time": fit_time,
-                        "predict_time": predict_time,
+                        "value": float(value),
                     }
                 )
-        except Exception as exc:
+        except Exception:
+            tb = traceback.format_exc()
             errors.append(
-                f"dataset={task.dataset_name} classifier={task.classifier_name} "
-                f"fold={fold_idx} error={type(exc).__name__}: {exc}"
+                f"FOLD ERROR: {ds_name} / {clf_name} / fold {fold_idx}\n{tb}"
             )
-    return pd.DataFrame(rows), errors
+    return rows, errors
 
 
-def _save_metric_tables(df: pd.DataFrame, output_dir: Path) -> None:
-    summary_dir = ensure_dir(output_dir / "summary")
-    grouped = (
-        df.groupby(["dataset", "classifier", "metric"])["value"]
-        .agg(mean="mean", std="std")
+def _save_summary_tables(df: pd.DataFrame, summary_dir: Path) -> None:
+    metric_rows = df[~df["metric"].isin(["fit_time", "predict_time"])]
+    agg = (
+        metric_rows.groupby(["dataset", "classifier", "metric"])["value"]
+        .agg(["mean", "std"])
         .reset_index()
     )
-    atomic_write_csv(grouped, summary_dir / "mean_std.csv")
+    agg.to_csv(summary_dir / "mean_std.csv", index=False)
 
-    for metric_name in sorted(df["metric"].unique().tolist()):
-        subset = grouped[grouped["metric"] == metric_name]
-        table = subset.pivot(
-            index="dataset", columns="classifier", values="mean"
-        ).reset_index()
-        atomic_write_csv(table, summary_dir / f"{metric_name}_table.csv")
-
-
-def _print_markdown_summary(df: pd.DataFrame) -> None:
-    acc = df[df["metric"] == "accuracy"]
-    if acc.empty:
-        return
-    summary = (
-        acc.groupby(["dataset", "classifier"], as_index=False)["value"]
-        .mean()
-        .sort_values(["dataset", "value"], ascending=[True, False])
-    )
-    top_rows = summary.groupby("dataset", as_index=False).head(3)
-    top_rows = top_rows.copy()
-    top_rows["classifier"] = top_rows["classifier"].str.replace(
-        "λ", "lambda", regex=False
-    )
-    print("\n### Top-3 Accuracy per Dataset")
-    print(
-        tabulate(
-            top_rows, headers="keys", tablefmt="github", showindex=False, floatfmt=".4f"
-        )
-    )
+    for metric in METRICS:
+        subset = agg[agg["metric"] == metric]
+        pivot_mean = subset.pivot(index="dataset", columns="classifier", values="mean")
+        pivot_mean.to_csv(summary_dir / f"{metric}_table_mean.csv")
+        pivot_std = subset.pivot(index="dataset", columns="classifier", values="std")
+        pivot_std.to_csv(summary_dir / f"{metric}_table_std.csv")
 
 
 def main() -> None:
@@ -205,7 +214,18 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--no-cv-lambda", action="store_true")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start fresh, ignoring any existing all_folds_temp.csv",
+    )
+    parser.add_argument(
+        "--low-priority",
+        action="store_true",
+        help="Run at below-normal process priority to reduce system lag",
+    )
     args = parser.parse_args()
+
     k_values = _parse_int_csv_arg(args.k_values)
     lambda_values = _parse_float_csv_arg(args.lambda_values)
     if len(k_values) != 3:
@@ -214,28 +234,29 @@ def main() -> None:
         raise ValueError("--lambda-values must contain at least one float.")
     k_mid = int(k_values[1])
 
+    if args.low_priority:
+        try:
+            import psutil
+            psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            LOGGER.info("Process priority set to BELOW_NORMAL")
+        except Exception as exc:
+            LOGGER.warning("Could not set low priority: %s", exc)
+
     configure_logging(logging.INFO)
     seed_everything(args.seed)
 
     output_dir = ensure_dir(args.output_dir)
     raw_dir = ensure_dir(output_dir / "raw")
-    ensure_dir(output_dir / "summary")
+    summary_dir = ensure_dir(output_dir / "summary")
     ensure_dir(output_dir / "stats")
     ensure_dir(output_dir / "figures")
 
     if args.quick:
-        dataset_names = ["iris", "wine", "breast_cancer"]
+        dataset_names = ["iris", "wine", "breast-w"]
     elif args.datasets == "all":
         dataset_names = DATASET_ORDER
     else:
         dataset_names = _parse_csv_arg(args.datasets)
-
-    if args.datasets == "all" and not args.quick:
-        all_data = load_all_datasets(cache_dir=args.cache_dir)
-    else:
-        all_data = {
-            ds: load_dataset(name=ds, cache_dir=args.cache_dir) for ds in dataset_names
-        }
 
     all_baselines = _build_baselines(
         no_cv_lambda=args.no_cv_lambda,
@@ -243,13 +264,60 @@ def main() -> None:
         lambda_values=lambda_values,
         random_state=args.seed,
     )
+    if args.classifiers != "all":
+        classifier_names = _parse_classifier_arg(
+            args.classifiers, list(all_baselines.keys())
+        )
+        all_baselines = {k: v for k, v in all_baselines.items() if k in classifier_names}
+
+    # Resume: load already-completed data and skip finished datasets.
+    temp_path = raw_dir / "all_folds_temp.csv"
+    all_rows: list[dict[str, Any]] = []
+    done_datasets: set[str] = set()
+    if not args.no_resume and temp_path.exists():
+        df_existing = pd.read_csv(temp_path)
+        all_rows = df_existing.to_dict("records")
+        clf_names = set(all_baselines.keys())
+        for ds, grp in df_existing.groupby("dataset"):
+            if clf_names <= set(grp["classifier"].unique()):
+                done_datasets.add(str(ds))
+        if done_datasets:
+            LOGGER.info(
+                "Resuming: skipping %d already-completed datasets: %s",
+                len(done_datasets),
+                sorted(done_datasets),
+            )
+
+    error_log = raw_dir / "errors.log"
+    total_tasks = len(dataset_names) * len(all_baselines) * args.n_folds
+    completed = len(done_datasets) * len(all_baselines) * args.n_folds
+
+    bar = tqdm(
+        total=total_tasks,
+        initial=completed,
+        unit="fold",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} folds [{elapsed}<{remaining}, {rate_fmt}]",
+    )
 
     dataset_meta_rows = []
-    for ds in dataset_names:
-        _, _, meta = all_data[ds]
+
+    for ds_name in dataset_names:
+        if ds_name in done_datasets:
+            continue
+
+        try:
+            X, y, meta = load_dataset(name=ds_name, cache_dir=args.cache_dir)
+        except Exception:
+            tb = traceback.format_exc()
+            LOGGER.error("Failed to load %s:\n%s", ds_name, tb)
+            with open(error_log, "a") as f:
+                f.write(f"DATASET LOAD ERROR: {ds_name}\n{tb}\n\n")
+            continue
+
         dataset_meta_rows.append(
             {
-                "name": ds,
+                "name": ds_name,
                 "n_samples": meta.get("n_samples"),
                 "n_features": meta.get("n_features"),
                 "n_classes": meta.get("n_classes"),
@@ -258,75 +326,82 @@ def main() -> None:
                 "identifier": meta.get("identifier"),
             }
         )
-    atomic_write_csv(
-        pd.DataFrame(dataset_meta_rows), output_dir / "summary" / "dataset_summary.csv"
-    )
 
-    if args.classifiers == "all":
-        classifier_names = list(all_baselines.keys())
-    else:
-        classifier_names = _parse_classifier_arg(
-            args.classifiers, list(all_baselines.keys())
-        )
-
-    tasks = [Task(ds, clf) for ds in dataset_names for clf in classifier_names]
-    LOGGER.info(
-        "Running %d tasks (%d datasets x %d classifiers).",
-        len(tasks),
-        len(dataset_names),
-        len(classifier_names),
-    )
-
-    def runner(task: Task) -> tuple[pd.DataFrame, list[str]]:
-        X, y, _ = all_data[task.dataset_name]
-        clf_factory = all_baselines[task.classifier_name]
-        return _run_single_task(
-            task=task,
-            X=X,
-            y=y,
-            clf_factory=clf_factory,
-            n_folds=args.n_folds,
-            random_state=args.seed,
-        )
-
-    try:
-        results = Parallel(n_jobs=args.n_jobs, prefer="threads")(
-            delayed(runner)(task)
-            for task in tqdm(tasks, desc="Tasks", total=len(tasks))
-        )
-    except PermissionError:
-        LOGGER.warning(
-            "Parallel backend unavailable in current environment; falling back to sequential execution."
-        )
-        results = [runner(task) for task in tqdm(tasks, desc="Tasks", total=len(tasks))]
-
-    fold_frames = [r[0] for r in results if not r[0].empty]
-    all_errors = [err for _, errs in results for err in errs]
-    all_folds = (
-        pd.concat(fold_frames, ignore_index=True) if fold_frames else pd.DataFrame()
-    )
-
-    if not all_folds.empty:
-        atomic_write_csv(all_folds, raw_dir / "all_folds.csv")
-        _save_metric_tables(all_folds, output_dir)
-        _print_markdown_summary(all_folds)
-
-    error_log = raw_dir / "errors.log"
-    error_log.write_text("\n".join(all_errors), encoding="utf-8")
-
-    if not all_folds.empty:
-        fixed_name = f"DW-NB(k={k_mid},λ=0.5)"
-        cv_name = f"DW-NB(k={k_mid},CV-λ)"
-        fixed = all_folds[all_folds["classifier"] == fixed_name]
-        cv = all_folds[all_folds["classifier"] == cv_name]
-        if not fixed.empty and not cv.empty:
-            t_fixed = float((fixed["fit_time"] + fixed["predict_time"]).mean())
-            t_cv = float((cv["fit_time"] + cv["predict_time"]).mean())
-            if t_cv > 2.0 * t_fixed:
-                LOGGER.warning(
-                    "DWGaussianNB_CV is >2x slower than fixed lambda. "
-                    "Consider --classifiers subset for faster runs."
+        # Run all classifiers for this dataset in parallel.
+        def _make_runner(name: str, factory: Any) -> Any:
+            def runner() -> tuple[list[dict[str, Any]], list[str]]:
+                return _run_classifier_on_dataset(
+                    ds_name=ds_name,
+                    clf_name=name,
+                    clf_factory=factory,
+                    X=X,
+                    y=y,
+                    n_folds=args.n_folds,
+                    random_state=args.seed,
                 )
+            return runner
+
+        runners = [_make_runner(clf_name, clf_factory)
+                   for clf_name, clf_factory in all_baselines.items()]
+
+        try:
+            clf_results = Parallel(n_jobs=args.n_jobs, prefer="threads")(
+                delayed(r)() for r in runners
+            )
+        except PermissionError:
+            LOGGER.warning("Parallel backend unavailable; falling back to sequential.")
+            clf_results = [r() for r in runners]
+
+        for clf_rows, clf_errors in clf_results:
+            all_rows.extend(clf_rows)
+            if clf_errors:
+                with open(error_log, "a") as f:
+                    f.write("\n".join(clf_errors) + "\n\n")
+        bar.update(len(all_baselines) * args.n_folds)
+
+        # Save intermediate results after each dataset.
+        if all_rows:
+            pd.DataFrame(all_rows).to_csv(temp_path, index=False)
+        bar.write(f"[saved] {ds_name} done ({completed + len(all_baselines) * args.n_folds}/{total_tasks} folds)")
+        completed += len(all_baselines) * args.n_folds
+
+    bar.close()
+
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        LOGGER.warning("No results produced.")
+        return
+
+    df.to_csv(raw_dir / "all_folds.csv", index=False)
+    _save_summary_tables(df, summary_dir)
+
+    if dataset_meta_rows:
+        pd.DataFrame(dataset_meta_rows).to_csv(
+            summary_dir / "dataset_summary.csv", index=False
+        )
+
+    # Print headline accuracy table.
+    print("\n" + "=" * 80)
+    print("HEADLINE RESULTS: Mean Accuracy across datasets")
+    print("=" * 80)
+    acc_rows = df[(df["metric"] == "accuracy") & ~df["metric"].isin(["fit_time", "predict_time"])]
+    if not acc_rows.empty:
+        agg = acc_rows.groupby(["dataset", "classifier"])["value"].mean()
+        acc_pivot = agg.unstack("classifier")
+        print(acc_pivot.round(4).to_markdown())
+
+    fixed_name = f"DW-NB(k={k_mid},λ=0.5)"
+    cv_name = f"DW-NB(k={k_mid},CV-λ)"
+    fixed = df[df["classifier"] == fixed_name]
+    cv = df[df["classifier"] == cv_name]
+    if not fixed.empty and not cv.empty:
+        t_fixed = float((fixed[fixed["metric"] == "fit_time"]["value"]).mean())
+        t_cv = float((cv[cv["metric"] == "fit_time"]["value"]).mean())
+        if t_cv > 2.0 * t_fixed:
+            LOGGER.warning(
+                "DWGaussianNB_CV is >2x slower than fixed lambda. "
+                "Consider --classifiers subset for faster runs."
+            )
 
 
 if __name__ == "__main__":

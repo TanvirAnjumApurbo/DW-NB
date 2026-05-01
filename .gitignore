@@ -1,11 +1,36 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
 .venv/
-results/raw/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data cache
 data/cache/
-*.pyc
-# Extra test cache and temp folders
-.tmp*/
-pytest-cache-files-*/
-tmp_perm_probe/
-data/cache_fresh/
-data/new_cache/
+
+# Temporary files
+_extract_results.py
+*.log
+.pytest_cache/
+
+# Claude Code local settings
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+PW-NB/

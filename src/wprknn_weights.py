@@ -1,7 +1,7 @@
 """WPRkNN weighting factors for DW-NB.
 
 Implements Amer, Ravana, and Habeeb (2025), Journal of Big Data,
-"Effective k-nearest neighbor models for data classification enhancement",
+"Effective k-nearest neighbor models for data classification Enhancement",
 Third version - weighted PRkNN (WPRkNN), Equations 9-15.
 
 Notes
@@ -35,36 +35,6 @@ def _validate_weight_components(weight_components: Iterable[str]) -> tuple[str, 
     return components
 
 
-def _compute_w3_neighbor_weights(distances: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Compute per-neighbor w3_i weights (Amer et al. 2025, Eq. 11 / 14).
-
-    Parameters
-    ----------
-    distances : NDArray[np.float64]
-        Sorted neighbor distances d_1 <= ... <= d_k for one test point.
-
-    Returns
-    -------
-    NDArray[np.float64]
-        Array of w3_i values in [0, 1] in non-degenerate cases. If d_k == d_1,
-        all values are set to 1, matching the paper.
-    """
-    if distances.size == 0:
-        return np.empty((0,), dtype=np.float64)
-
-    d_1 = float(distances[0])
-    d_k = float(distances[-1])
-    if np.isclose(d_k, d_1):
-        return np.ones_like(distances, dtype=np.float64)
-
-    numerator_1 = d_k - distances
-    denominator_1 = d_k - d_1
-    numerator_2 = d_k + distances
-    denominator_2 = d_k + d_1
-    w3 = (numerator_1 / denominator_1) * (numerator_2 / denominator_2)
-    return np.clip(w3, 0.0, 1.0)
-
-
 def _normalize_component(
     component_raw: NDArray[np.float64],
     n_classes: int,
@@ -80,9 +50,9 @@ def _normalize_component(
     bad_rows = np.where(~good)[0]
     if bad_rows.size > 0:
         LOGGER.debug(
-            "Component %s had zero sum for rows %s; using uniform 1/L fallback.",
+            "Component %s had zero sum for %d rows; using uniform 1/L fallback.",
             component_name,
-            bad_rows.tolist(),
+            bad_rows.size,
         )
         normalized[bad_rows] = 1.0 / float(n_classes)
     return normalized
@@ -100,6 +70,8 @@ def compute_wprknn_weights(
     nn_index: NearestNeighbors | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
     """Compute WPRkNN class-composite weights (Amer et al. 2025, Eq. 9-15).
+
+    Fully vectorized over test samples and classes using numpy broadcasting.
 
     Parameters
     ----------
@@ -129,13 +101,6 @@ def compute_wprknn_weights(
         ``len(weight_components)`` in non-degenerate cases.
     nn_result : NDArray[np.int64]
         Neighbor index matrix of shape (M, k_eff), where k_eff=min(k, N).
-
-    References
-    ----------
-    - Eq. 9 / 12: w1^c = sum_{i in N_{k,c}} 1 / d_i
-    - Eq. 10 / 13: w2^c = |N_{k,c}| / k
-    - Eq. 11 / 14: per-neighbor relative-distance weighting used in w3^c
-    - Eq. 15: component normalization then summation into W_c
     """
     if k <= 0:
         raise ValueError("k must be >= 1.")
@@ -173,45 +138,44 @@ def compute_wprknn_weights(
     distances = distances.astype(np.float64, copy=False)
     indices = indices.astype(np.int64, copy=False)
 
-    w1_raw = np.zeros((n_test, n_classes), dtype=np.float64)
-    w2_raw = np.zeros((n_test, n_classes), dtype=np.float64)
-    w3_raw = np.zeros((n_test, n_classes), dtype=np.float64)
+    # ── Vectorized weight computation ──
+    # neighbor_labels: (M, k_eff) — class label of each neighbor
+    neighbor_labels = y_train[indices]
 
-    for row_idx in range(n_test):
-        row_indices = indices[row_idx]
-        row_distances = distances[row_idx]
-        row_labels = y_train[row_indices]
-        w3_neighbors = _compute_w3_neighbor_weights(row_distances)
+    # class_mask: (M, k_eff, L) — True where neighbor j of test i is class c
+    class_mask = neighbor_labels[:, :, np.newaxis] == classes[np.newaxis, np.newaxis, :]
+    class_mask_f = class_mask.astype(np.float64)
 
-        for class_idx, class_label in enumerate(classes):
-            class_mask = row_labels == class_label
-            if not np.any(class_mask):
-                continue
+    # w1: inverse-distance sum per class (Eq. 9/12)
+    safe_distances = np.maximum(distances, eps)
+    inv_distances = 1.0 / safe_distances  # (M, k_eff)
+    w1_raw = np.einsum("ij,ijc->ic", inv_distances, class_mask_f)
 
-            class_distances = row_distances[class_mask]
-            safe_distances = np.maximum(class_distances, eps)
-            if np.any(class_distances <= 0.0):
-                LOGGER.debug(
-                    "Zero distance encountered for row=%d class=%s; applying eps floor.",
-                    row_idx,
-                    class_label,
-                )
-            w1_raw[row_idx, class_idx] = np.sum(1.0 / safe_distances, dtype=np.float64)
-            w2_raw[row_idx, class_idx] = float(np.count_nonzero(class_mask)) / float(
-                k_eff
-            )
-            w3_raw[row_idx, class_idx] = np.sum(
-                w3_neighbors[class_mask], dtype=np.float64
-            )
+    # w2: class-frequency ratio (Eq. 10/13)
+    w2_raw = class_mask_f.sum(axis=1) / float(k_eff)
 
+    # w3: distance-weighted class score (Eq. 11/14)
+    d_1 = distances[:, 0:1]   # (M, 1)
+    d_k = distances[:, -1:]   # (M, 1)
+    degenerate = np.isclose(d_k, d_1)  # (M, 1) — all neighbors equidistant
+
+    denom1 = np.where(degenerate, 1.0, d_k - d_1)
+    denom2 = np.where(degenerate, 1.0, d_k + d_1)
+    w3_per_neighbor = ((d_k - distances) / denom1) * ((d_k + distances) / denom2)
+    w3_per_neighbor = np.where(degenerate, 1.0, w3_per_neighbor)
+    w3_per_neighbor = np.clip(w3_per_neighbor, 0.0, 1.0)  # (M, k_eff)
+
+    w3_raw = np.einsum("ij,ijc->ic", w3_per_neighbor, class_mask_f)
+
+    # Normalize each component and sum the requested ones (Eq. 15).
     component_map = {
-        "w1": _normalize_component(w1_raw, n_classes=n_classes, component_name="w1"),
-        "w2": _normalize_component(w2_raw, n_classes=n_classes, component_name="w2"),
-        "w3": _normalize_component(w3_raw, n_classes=n_classes, component_name="w3"),
+        "w1": _normalize_component(w1_raw, n_classes, "w1"),
+        "w2": _normalize_component(w2_raw, n_classes, "w2"),
+        "w3": _normalize_component(w3_raw, n_classes, "w3"),
     }
 
     W = np.zeros((n_test, n_classes), dtype=np.float64)
-    for component in components:
-        W += component_map[component]
+    for comp in components:
+        W += component_map[comp]
 
     return W, indices
