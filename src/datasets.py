@@ -171,7 +171,7 @@ def _preprocess(
         "n_classes": int(classes.size),
         "imbalance_ratio": float(counts.max() / counts.min()),
         "fraction_categorical_features": float(len(cat_cols) / max(X_df.shape[1], 1)),
-        "missing_row_fraction": float(np.isnan(X_df.values).any(axis=1).mean()),
+        "missing_row_fraction": float(pd.isnull(X_df).any(axis=1).mean()),
     }
     return X_arr, y_arr, meta
 

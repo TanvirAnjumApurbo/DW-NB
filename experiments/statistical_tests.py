@@ -117,7 +117,8 @@ def _plot_cd_diagram(avg_ranks: pd.Series, n_datasets: int, output_path: Path) -
         on_left = rank > mid
         ha      = "right" if on_left else "left"
         offset  = -0.20 if on_left else 0.20
-        ax.text(rank + offset, y, f"{name}  ({rank:.2f})", ha=ha, va="center", fontsize=8)
+        label   = name.replace(LAMBDA_CHAR, r"$\lambda$")
+        ax.text(rank + offset, y, f"{label}  ({rank:.2f})", ha=ha, va="center", fontsize=8)
 
     cd_y = k + 0.9
     ax.annotate("", xy=(1 + cd, cd_y), xytext=(1.0, cd_y),

@@ -136,6 +136,7 @@ def _tex(s: str) -> str:
     s = s.replace("≈", r"$\approx$")
     s = s.replace("%", r"\%")
     s = s.replace(LAMBDA, r"$\lambda$")
+    s = s.replace("\u03c1", r"$\rho$")
     return s
 
 
@@ -467,7 +468,7 @@ def plot_lambda_sensitivity(
         # Pure NB reference (λ=0)
         nb_idx = np.argmin(np.abs(lam_vals - 0.0))
         ax.axhline(means[nb_idx], color=BASE_COLOR, linestyle=":",
-                   linewidth=1.0, label="NB  (λ=0)")
+                   linewidth=1.0, label=_tex("NB  (\u03bb=0)"))
 
         ax.set_title(ds, fontsize=9)
         ax.set_xlabel(_tex(f"{LAMBDA}"))
