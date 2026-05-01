@@ -292,6 +292,14 @@ def main() -> None:
     total_tasks = len(dataset_names) * len(all_baselines) * args.n_folds
     completed = len(done_datasets) * len(all_baselines) * args.n_folds
 
+    LOGGER.info(
+        "Experiment: %d datasets × %d classifiers × %d folds = %d folds total",
+        len(dataset_names), len(all_baselines), args.n_folds, total_tasks,
+    )
+    if done_datasets:
+        LOGGER.info("Resuming: %d datasets already done, %d remaining.",
+                    len(done_datasets), len(dataset_names) - len(done_datasets))
+
     bar = tqdm(
         total=total_tasks,
         initial=completed,
@@ -301,10 +309,15 @@ def main() -> None:
     )
 
     dataset_meta_rows = []
+    n_todo = len([d for d in dataset_names if d not in done_datasets])
+    ds_idx = 0
 
     for ds_name in dataset_names:
         if ds_name in done_datasets:
             continue
+
+        ds_idx += 1
+        bar.set_description(f"[{ds_idx}/{n_todo}] {ds_name}")
 
         try:
             X, y, meta = load_dataset(name=ds_name, cache_dir=args.cache_dir)
@@ -358,12 +371,19 @@ def main() -> None:
                 with open(error_log, "a") as f:
                     f.write("\n".join(clf_errors) + "\n\n")
         bar.update(len(all_baselines) * args.n_folds)
+        completed += len(all_baselines) * args.n_folds
 
         # Save intermediate results after each dataset.
         if all_rows:
             pd.DataFrame(all_rows).to_csv(temp_path, index=False)
-        bar.write(f"[saved] {ds_name} done ({completed + len(all_baselines) * args.n_folds}/{total_tasks} folds)")
-        completed += len(all_baselines) * args.n_folds
+        n_samp = meta.get("n_samples", "?")
+        n_feat = meta.get("n_features", "?")
+        n_cls  = meta.get("n_classes", "?")
+        bar.write(
+            f"[{ds_idx}/{n_todo}] {ds_name}  "
+            f"({n_samp}×{n_feat}, {n_cls} classes)  "
+            f"— {completed}/{total_tasks} folds done"
+        )
 
     bar.close()
 
