@@ -72,38 +72,73 @@ def _average_ranks(pivot: pd.DataFrame, metric: str) -> pd.Series:
 
 
 def _plot_cd_diagram(avg_ranks: pd.Series, n_datasets: int, output_path: Path) -> None:
-    """Render a simple CD diagram."""
+    """Render a CD diagram using the publication style from visualize.py."""
+    # Delegate to the publication-quality function in visualize.py
+    from experiments.visualize import plot_cd_diagram as _viz_cd
+
+    # Build a minimal mean_std DataFrame compatible with plot_cd_diagram
+    metric = output_path.stem.replace("cd_diagram_", "")
+    rows = [
+        {"dataset": f"_dummy_{i}", "classifier": clf, "metric": metric, "mean": float(rank)}
+        for i, (clf, rank) in enumerate(avg_ranks.items())
+    ]
+    # plot_cd_diagram recomputes ranks from raw means — here avg_ranks IS already
+    # the final rank, so we embed them as pre-ranked values across dummy datasets.
+    # Instead, just re-use the same plotting logic inline so we don't need dummy data.
+
     k = avg_ranks.size
-    q_alpha = 3.314  # Demsar (2006) approximation at alpha=0.05
+    q_table = {
+        2: 1.960, 3: 2.343, 4: 2.569, 5: 2.728,
+        6: 2.850, 7: 2.949, 8: 3.031, 9: 3.102,
+        10: 3.164, 11: 3.219, 12: 3.268, 13: 3.313,
+    }
+    q_alpha = q_table.get(k, 3.314)
     cd = q_alpha * np.sqrt((k * (k + 1)) / (6.0 * n_datasets))
 
-    fig, ax = plt.subplots(figsize=(10, 2.8))
-    y = 1.0
-    x_min, x_max = 1, k
-    ax.hlines(y, x_min, x_max, color="black")
-    for idx, (name, rank) in enumerate(avg_ranks.items()):
-        ax.vlines(rank, y - 0.08, y + 0.08, color="black")
-        ax.text(
-            rank,
-            y + 0.12 + 0.1 * (idx % 2),
-            name,
-            ha="center",
-            va="bottom",
-            fontsize=8,
-            rotation=25,
-        )
+    names     = list(avg_ranks.index)
+    rank_vals = list(avg_ranks.values)
+    mid       = float(np.median(rank_vals))
 
-    cd_start = x_max - cd
-    ax.hlines(y - 0.25, cd_start, x_max, color="black", linewidth=2)
-    ax.vlines([cd_start, x_max], y - 0.30, y - 0.20, color="black", linewidth=2)
-    ax.text((cd_start + x_max) / 2, y - 0.38, f"CD={cd:.3f}", ha="center", fontsize=9)
+    fig, ax = plt.subplots(figsize=(8, max(2.8, k * 0.44)))
 
-    ax.set_xlim(x_min - 0.2, x_max + 0.2)
+    for i in range(k):
+        for j in range(i + 1, k):
+            if abs(rank_vals[i] - rank_vals[j]) < cd:
+                ax.plot(
+                    [rank_vals[i], rank_vals[j]],
+                    [k - i - 0.12, k - j + 0.12],
+                    color="0.6", linewidth=2.2, alpha=0.45, solid_capstyle="round",
+                )
+
+    for i, (name, rank) in enumerate(zip(names, rank_vals)):
+        y = k - i
+        ax.plot(rank, y, "o", color="#1a7a4a", markersize=8, zorder=3,
+                markeredgecolor="white", markeredgewidth=0.6)
+        on_left = rank > mid
+        ha      = "right" if on_left else "left"
+        offset  = -0.20 if on_left else 0.20
+        ax.text(rank + offset, y, f"{name}  ({rank:.2f})", ha=ha, va="center", fontsize=8)
+
+    cd_y = k + 0.9
+    ax.annotate("", xy=(1 + cd, cd_y), xytext=(1.0, cd_y),
+                arrowprops=dict(arrowstyle="<->", color="black", lw=1.2))
+    ax.text(1 + cd / 2, cd_y + 0.22, f"CD = {cd:.2f}",
+            ha="center", va="bottom", fontsize=8)
+
+    ax.set_xlim(0.3, k + 0.7)
+    ax.set_ylim(0, k + 1.7)
+    ax.set_xlabel("Average Rank  (lower = better)", labelpad=6)
+    ax.set_title(f"Critical Difference — {metric.replace('_', ' ').title()}"
+                 f"  (n = {n_datasets} datasets)")
     ax.set_yticks([])
-    ax.set_xlabel("Average Rank (lower is better)")
-    fig.tight_layout()
+    ax.grid(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    for ext in ["png", "pdf"]:
+        fig.savefig(output_path.with_suffix(f".{ext}"), bbox_inches="tight", dpi=300)
     plt.close(fig)
 
 
