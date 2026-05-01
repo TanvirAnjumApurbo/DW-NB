@@ -281,62 +281,7 @@ def _write_report(results_dir: Path, raw_df: pd.DataFrame) -> None:
     except Exception:
         pass
 
-    report = []
-    report.append("# REPORT")
-    report.append("")
-    report.append("## 1. Environment info")
-    report.extend(env_lines)
-    report.append("")
-    report.append("## 2. Dataset summary table")
-    report.append(_md_table(dataset_summary))
-    report.append("## 3. Headline accuracy table (best per row in bold)")
-    report.append(headline_md)
-    report.append("## 4. lambda analysis (DWGaussianNB_CV)")
-    report.append(_md_table(cv_lambda))
-    report.append("## 5. NB-kNN agreement rate table")
-    report.append(_md_table(agreement))
-    report.append("## 6. Weight component ablation summary")
-    report.append(_md_table(weight_ablation))
-    if (
-        not weight_ablation.empty
-        and "all_three_ge_best_single" in weight_ablation.columns
-    ):
-        better_count = int(weight_ablation["all_three_ge_best_single"].sum())
-        report.append(
-            f"Combining all three components is >= best individual on {better_count}/{weight_ablation.shape[0]} datasets."
-        )
-    report.append("")
-    report.append("## 7. Win/tie/loss counts")
-    report.append(_md_table(wt_df))
-    report.append("## 8. Geometric interpolation vs arithmetic averaging")
-    report.append(_md_table(h2h))
-    report.append("## 9. Friedman p-values and average ranks")
-    report.append(_md_table(friedman))
-    report.append(
-        _md_table(
-            ranks[ranks["metric"].isin(HEADLINE_METRICS)] if not ranks.empty else ranks
-        )
-    )
-    report.append("## 10. Notable observations")
-    report.append(f"- {runtime_note}")
-    if not agreement.empty and {"nb_knn_agreement_rate", "accuracy_gain"}.issubset(
-        agreement.columns
-    ):
-        rho = (
-            agreement["spearman_rho"].iloc[0]
-            if "spearman_rho" in agreement.columns
-            else np.nan
-        )
-        pval = (
-            agreement["spearman_pvalue"].iloc[0]
-            if "spearman_pvalue" in agreement.columns
-            else np.nan
-        )
-        report.append(
-            f"- Spearman correlation (agreement vs gain): rho={rho:.4f}, p={pval:.4g}."
-        )
-
-    (results_dir / "REPORT.md").write_text("\n".join(report), encoding="utf-8")
+    LOGGER.info("Statistical tests complete. results/REPORT.md is not auto-generated; edit manually.")
 
 
 def main() -> None:
