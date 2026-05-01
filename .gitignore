@@ -25,6 +25,9 @@ data/cache/
 _extract_results.py
 *.log
 .pytest_cache/
+.mplconfig/
+.tmp_sklearn_safe
+results/raw/all_folds_temp.csv
 
 # Claude Code local settings
 .claude/
